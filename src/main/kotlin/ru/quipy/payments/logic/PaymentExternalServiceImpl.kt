@@ -8,12 +8,15 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import ru.quipy.common.utils.CoroutineRateLimiter
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -45,6 +48,13 @@ class PaymentExternalServiceImpl(
         dispatcher(Dispatcher(httpClientExecutor))
         build()
     }
+    private val _ratelimiter = CoroutineRateLimiter(rateLimitPerSec, TimeUnit.SECONDS)
+    override val rateLimiter: CoroutineRateLimiter
+        get() = _ratelimiter
+
+    private val _window =NonBlockingOngoingWindow(parallelRequests)
+    override val window: NonBlockingOngoingWindow
+        get() = _window
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId. Already passed: ${now() - paymentStartedAt} ms")
