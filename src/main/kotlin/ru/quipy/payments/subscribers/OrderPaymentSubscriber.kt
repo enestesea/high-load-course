@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Qualifier
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.NamedThreadFactory
+import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.core.EventSourcingService
 import ru.quipy.orders.api.OrderAggregate
 import ru.quipy.orders.api.OrderPaymentStartedEvent
@@ -52,7 +53,18 @@ class OrderPaymentSubscriber {
                     }
                     logger.info("Payment ${createdEvent.paymentId} for order ${event.orderId} created.")
 
-                    paymentService.submitPaymentRequest(createdEvent.paymentId, event.amount, event.createdAt)
+                    while(true) {
+                        if (paymentService.window.putIntoWindow()::class==NonBlockingOngoingWindow.WindowResponse.Success::class) {
+                            if (paymentService.rateLimiter.tick()) {
+                                paymentService.submitPaymentRequest(createdEvent.paymentId, event.amount, event.createdAt);
+                                break;
+                            }
+                            else {
+                                paymentService.window.releaseWindow();
+                            }
+                        }
+                    }
+
                 }
             }
         }
