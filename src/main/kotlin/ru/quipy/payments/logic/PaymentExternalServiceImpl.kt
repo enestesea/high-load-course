@@ -47,7 +47,10 @@ class PaymentExternalServiceImpl(
     private val httpClientExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
 //тут используем http2
     private val client = OkHttpClient.Builder().protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE)).run {
-        dispatcher(Dispatcher(httpClientExecutor))
+        dispatcher(Dispatcher(httpClientExecutor).apply {
+            maxRequests = 100
+            maxRequestsPerHost = 100
+        })
         build()
     }
 
