@@ -45,10 +45,18 @@ class ExternalServicesConfig {
         // Call costs 30
         private val accountProps_4 = ExternalServiceProperties(
                 "test",
-                "default-4",
+                "default-42",
                 parallelRequests = 8,
                 rateLimitPerSec = 5,
                 request95thPercentileProcessingTime = Duration.ofMillis(10_000),
+        )
+
+        private val accountProps_5 = ExternalServiceProperties(
+            "test",
+            "default-5",
+            parallelRequests = 8,
+            rateLimitPerSec = 5,
+            request95thPercentileProcessingTime = Duration.ofMillis(10_000),
         )
     }
 
@@ -56,6 +64,7 @@ class ExternalServicesConfig {
     fun fastExternalService() =
             PaymentExternalServiceImpl(
                     listOf(
+                            accountProps_5,
                             accountProps_4,
                             accountProps_3,
                             accountProps_2

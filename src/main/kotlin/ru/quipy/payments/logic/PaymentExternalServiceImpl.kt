@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry
 import kotlinx.coroutines.*
 import okhttp3.*
 import org.slf4j.LoggerFactory
@@ -44,16 +47,6 @@ class PaymentExternalServiceImpl(
 
     private val accountProcessingWorkers = properties.map {
         it.toAccountProcessingWorker()
-    }
-
-    private val clientThreadFactory = NamedThreadFactory("client-dispatcher-thread")
-    private val httpClientExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), clientThreadFactory)
-    private val client = OkHttpClient.Builder().protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE)).run {
-        dispatcher(Dispatcher(httpClientExecutor).apply {
-            maxRequests = 100
-            maxRequestsPerHost = 100
-        })
-        build()
     }
 
     private fun pickAccountProcessingWorker(
@@ -131,6 +124,21 @@ class PaymentExternalServiceImpl(
         private val requestCounter = NonBlockingOngoingWindow(info.maxParallelRequests)
         private val rateLimiter = RateLimiter(info.rateLimitPerSec)
 
+        private val clientThreadFactory = NamedThreadFactory("client-dispatcher-thread")
+        private val httpClientExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), clientThreadFactory)
+        private val client = OkHttpClient.Builder().protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE)).run {
+            dispatcher(Dispatcher(httpClientExecutor).apply {
+                maxRequests = 100
+                maxRequestsPerHost = 100
+            })
+            build()
+        }
+
+        private val circuitBreakerConfig = CircuitBreakerConfig.custom()
+            .build()
+        private val circuitBreakerRegistry = CircuitBreakerRegistry.of(circuitBreakerConfig)
+        private val circuitBreaker = circuitBreakerRegistry.circuitBreaker("circuit-breaker-1")
+
         private fun sendRequest(
                 transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long
         ) = requestScope.launch {
@@ -192,24 +200,28 @@ class PaymentExternalServiceImpl(
             paymentId: UUID, amount: Int, paymentStartedAt: Long
         ) {
             val transactionId = UUID.randomUUID()
-            paymentExecutor.submit(
-                Runnable {
-                    while(true) {
-                        val windowResult = requestCounter.putIntoWindow()
-                        if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
-                            while (!rateLimiter.tick()) {
+            val supplier = CircuitBreaker.decorateSupplier(circuitBreaker) {
+                paymentExecutor.submit(
+                    Runnable {
+                        while(true) {
+                            val windowResult = requestCounter.putIntoWindow()
+                            if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                                while (!rateLimiter.tick()) {
+                                    continue
+                                }
+
+                                break
+                            } else {
                                 continue
                             }
-
-                            break
-                        } else {
-                            continue
                         }
-                    }
 
-                    sendRequest(transactionId, paymentId, amount, paymentStartedAt)
-                }
-            )
+                        sendRequest(transactionId, paymentId, amount, paymentStartedAt)
+                    }
+                )
+            }
+
+            circuitBreaker.executeSupplier(supplier)
             logger.warn("[${info.accountName}] Added payment $paymentId in queue. Current number ${paymentQueue.size}. Already passed: ${now() - paymentStartedAt} ms")
         }
     }
