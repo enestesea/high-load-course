@@ -2,22 +2,25 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.common.utils.CustomPolicy
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.NonBlockingOngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.lang.Runnable
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
 
@@ -43,9 +46,8 @@ class PaymentExternalServiceImpl(
         it.toAccountProcessingWorker()
     }
 
-// нужно, чтобы всегда использовалось то количесвто ядер процессора, которое использует комп
-    private val httpClientExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())
-//тут используем http2
+    private val clientThreadFactory = NamedThreadFactory("client-dispatcher-thread")
+    private val httpClientExecutor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors(), clientThreadFactory)
     private val client = OkHttpClient.Builder().protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE)).run {
         dispatcher(Dispatcher(httpClientExecutor).apply {
             maxRequests = 100
@@ -106,15 +108,28 @@ class PaymentExternalServiceImpl(
     inner class AccountProcessingWorker(
             val info: AccountProcessingInfo
     ) {
-        @OptIn(ExperimentalCoroutinesApi::class)
-        private val requestScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+        val paymentQueue = LinkedBlockingQueue<Runnable>();
+        private val accountThreadFactory = NamedThreadFactory("account-processing-thread")
+        private val rejectedExecutionHandler = CustomPolicy()
+
+        private val paymentExecutor = ThreadPoolExecutor(
+            info.maxParallelRequests,
+            info.maxParallelRequests,
+            0,
+            TimeUnit.MILLISECONDS,
+            paymentQueue,
+            accountThreadFactory,
+            rejectedExecutionHandler
+        )
 
         @OptIn(ExperimentalCoroutinesApi::class)
-        private val queueProcessingScope = CoroutineScope(Dispatchers.IO.limitedParallelism(100))
+        private val requestScope = CoroutineScope(
+            Dispatchers.IO.limitedParallelism(100)
+                    + CoroutineName("CoroutineScope: payment request scope")
+        )
 
         private val requestCounter = NonBlockingOngoingWindow(info.maxParallelRequests)
         private val rateLimiter = RateLimiter(info.rateLimitPerSec)
-        val paymentQueue = LinkedList<PaymentInfo>();
 
         private fun sendRequest(
                 transactionId: UUID, paymentId: UUID, amount: Int, paymentStartedAt: Long
@@ -174,41 +189,28 @@ class PaymentExternalServiceImpl(
         }
 
         fun enqueuePayment(
-                paymentId: UUID, amount: Int, paymentStartedAt: Long
-        ) = queueProcessingScope.launch {
-            paymentQueue.add(PaymentInfo(paymentId, amount, paymentStartedAt))
-            logger.warn("[${info.accountName}] Added payment $paymentId in queue. Current number ${paymentQueue.size}. Already passed: ${now() - paymentStartedAt} ms")
-        }
+            paymentId: UUID, amount: Int, paymentStartedAt: Long
+        ) {
+            val transactionId = UUID.randomUUID()
+            paymentExecutor.submit(
+                Runnable {
+                    while(true) {
+                        val windowResult = requestCounter.putIntoWindow()
+                        if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
+                            while (!rateLimiter.tick()) {
+                                continue
+                            }
 
-        private val processQueue = queueProcessingScope.launch {
-            while (true) {
-                if (paymentQueue.size != 0) {
-                    val windowResult = requestCounter.putIntoWindow()
-                    if (windowResult is NonBlockingOngoingWindow.WindowResponse.Success) {
-                        while (!rateLimiter.tick()) {
+                            break
+                        } else {
                             continue
                         }
-                    } else {
-                        continue
-                    }
-                } else {
-                    continue
-                }
-
-                val payment = paymentQueue.pop()
-                if (payment != null) {
-                    logger.warn("[${info.accountName}] Submitting payment request for payment ${payment.id}. Already passed: ${now() - payment.startedAt} ms")
-                    val transactionId = UUID.randomUUID()
-                    logger.info("[${info.accountName}] Submit for ${payment.id} , txId: $transactionId")
-                    paymentESService.update(payment.id) {
-                        it.logSubmission(
-                                success = true, transactionId, now(), Duration.ofMillis(now() - payment.startedAt)
-                        )
                     }
 
-                    sendRequest(transactionId, payment.id, payment.amount, payment.startedAt)
+                    sendRequest(transactionId, paymentId, amount, paymentStartedAt)
                 }
-            }
+            )
+            logger.warn("[${info.accountName}] Added payment $paymentId in queue. Current number ${paymentQueue.size}. Already passed: ${now() - paymentStartedAt} ms")
         }
     }
 
